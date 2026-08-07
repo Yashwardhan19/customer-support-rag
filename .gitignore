@@ -3,3 +3,4 @@ data/
 qdrant_data/
 .env
 __pycache__/
+output/

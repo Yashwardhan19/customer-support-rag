@@ -1,202 +1,237 @@
-import os
-import streamlit as st
-from sentence_transformers import SentenceTransformer
-# from embeddings import get_embedding
-from qdrant_client import QdrantClient
-from groq import Groq
-from dotenv import load_dotenv
+"""
+app.py
 
-load_dotenv(dotenv_path=".env")
+Streamlit UI for the RAG pipeline, with ChatGPT-style persistent chat
+sessions (single-user, no login — see chat_store.py):
+    1. User uploads a PDF, indexed via the pipeline (loaders -> chunking
+       -> embeddings -> vector_store).
+    2. Each chat session is tied to one document and stored in SQLite, so
+       chat history survives app restarts / new browser tabs.
+    3. Sidebar shows recent chats (most recently active first), a
+       "New chat" button, and lets you switch between past conversations.
 
-QDRANT_PATH = "qdrant_data"
-COLLECTION_NAME = "support_docs"
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-GROQ_MODEL = "llama-3.1-8b-instant"
-TOP_K = 3
+Requires (on top of everything already installed for the pipeline):
+    pip install -U streamlit
 
-SYSTEM_PROMPT = """You are a customer support assistant for an e-commerce company.
-Answer the customer's question using ONLY the CONTEXT provided below.
-
-Rules:
-- Use only the information present in CONTEXT. Do not add anything from outside knowledge.
-- If the CONTEXT does not contain the answer, clearly say: "I'm sorry, I don't have
-  that information. Please contact our support team for further help."
-- Always reply in the SAME language and script the customer used in their question.
-  - If the customer wrote in English, reply in English.
-  - If the customer wrote in Hindi (Devanagari), reply in Hindi (Devanagari).
-  - If the customer wrote in Hinglish (Hindi words in Roman/English script), reply in Hinglish the same way.
-  - Never switch the customer's language on them.
-- Keep answers clear, short, and helpful.
-- Never hallucinate or invent information.
+Run:
+    streamlit run app.py
 """
 
-st.set_page_config(page_title="Customer Support Assistant", page_icon="💬", layout="centered")
+import os
+import tempfile
+
+import streamlit as st
+
+from src.loaders import read_pdf
+from src.chunking import chunk_documents
+from src.embedding import embed_documents
+from src.vector_store import upsert_documents
+from src.retrieval import answer_question
+from src import config
+from chat_store import (
+    init_db, create_chat, list_chats, get_messages,
+    add_message, rename_chat_if_untitled, delete_chat, update_chat_source,
+)
+
+init_db()
+
+st.set_page_config(page_title="Chat with your PDF", page_icon="📄", layout="wide")
+st.title("Helper.ai")
+
+# --- Session state setup ---
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = set()   # filenames indexed into Qdrant this session
+if "active_chat_id" not in st.session_state:
+    st.session_state.active_chat_id = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []             # loaded from DB for the active chat
 
 
-# ---------- Cached resources (loaded once, not on every rerun) ----------
-@st.cache_resource
-def load_embed_model():
-    return SentenceTransformer(EMBED_MODEL_NAME)
+def load_chat(chat_id: str) -> None:
+    """Switches the active chat and loads its messages from SQLite."""
+    st.session_state.active_chat_id = chat_id
+    st.session_state.messages = get_messages(chat_id)
 
 
-@st.cache_resource
-def load_qdrant_client():
-    return QdrantClient(path=QDRANT_PATH)
+def start_new_chat() -> None:
+    """Creates a fresh, empty chat with no document attached yet."""
+    chat_id = create_chat(source_document=None)
+    load_chat(chat_id)
 
 
-@st.cache_resource
-def load_groq_client():
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        return None
-    return Groq(api_key=api_key)
-
-
-@st.cache_data
-def rough_token_count(text):
-    return max(1, len(text) // 4)
-
-
-@st.cache_data
-def get_full_docs_token_estimate(_client):
-    all_points, _ = _client.scroll(
-        collection_name=COLLECTION_NAME, limit=10000, with_payload=True, with_vectors=False
-    )
-    full_text = "\n\n".join(p.payload["text"] for p in all_points)
-    return rough_token_count(full_text)
-
-
-def retrieve_chunks(client,embed_model, query, top_k=TOP_K):
-    query_vector = embed_model.encode(query).tolist()
-    results = client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=top_k,
-        with_payload=True,
-    ).points
-    return results
-
-
-def build_prompt(query, retrieved_chunks):
-    context = "\n\n".join(
-        f"[Source: {r.payload['source']}]\n{r.payload['text']}" for r in retrieved_chunks
-    )
-    user_prompt = f"CONTEXT:\n{context}\n\nCUSTOMER QUESTION: {query}"
-    return user_prompt
-
-
-def ask_groq(groq_client, user_prompt):
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        max_tokens=500,
-    )
-    return response.choices[0].message.content, response.usage
-
-
-# ---------- UI ----------
-st.title("💬 Customer Support Assistant")
-st.caption("RAG-powered • Qdrant + Groq (Llama 3.1) + sentence-transformers")
-
-# Sidebar: setup status + info
-with st.sidebar:
-    st.header("Setup Status")
-
-    api_key_present = bool(os.environ.get("GROQ_API_KEY"))
-    st.write("✅ GROQ_API_KEY set" if api_key_present else "❌ GROQ_API_KEY missing")
+def process_pdf(uploaded_file) -> bool:
+    """
+    Save the upload to disk, run it through the full pipeline, upsert into
+    Qdrant, and attach it as the active chat's document. Returns True on
+    success, False on failure (with an error shown to the user).
+    """
+    filename = uploaded_file.name
 
     try:
-        qdrant_client = load_qdrant_client()
-        collection_exists = qdrant_client.collection_exists(COLLECTION_NAME)
-        st.write("✅ Qdrant collection found" if collection_exists else "❌ Collection not found — run ingest.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, filename)
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            with st.spinner(f"Extracting '{filename}' (text, tables, charts)..."):
+                pages = read_pdf(tmp_path)
+                flat_chunks = [
+                    {"page": p["page"], **c} for p in pages for c in p["chunks"]
+                ]
+                docs = [{"source": filename, "chunks": flat_chunks}]
+
+            with st.spinner("Chunking..."):
+                docs = chunk_documents(docs)
+
+            with st.spinner("Generating embeddings..."):
+                docs = embed_documents(docs)
+
+            with st.spinner("Indexing into Qdrant..."):
+                count = upsert_documents(docs)
+
     except Exception as e:
-        collection_exists = False
-        st.write(f"❌ Qdrant error: {e}")
+        st.error(f"Failed to process '{filename}': {e}")
+        with st.expander("Error details"):
+            st.exception(e)
+        return False
+
+    st.session_state.processed_files.add(filename)
+
+    # Attach this document to the CURRENT chat (create one if none is active yet)
+    if st.session_state.active_chat_id is None:
+        chat_id = create_chat(source_document=filename, title="New chat")
+        load_chat(chat_id)
+    else:
+        update_chat_source(st.session_state.active_chat_id, filename)
+
+    st.success(f"Indexed '{filename}' — {count} chunks stored.")
+    return True
+
+
+def get_active_source() -> str | None:
+    """Looks up which document the active chat is tied to."""
+    for c in list_chats():
+        if c["chat_id"] == st.session_state.active_chat_id:
+            return c["source_document"]
+    return None
+
+
+# --- Ensure there's always an active chat ---
+if st.session_state.active_chat_id is None:
+    existing = list_chats()
+    if existing:
+        load_chat(existing[0]["chat_id"])
+    else:
+        start_new_chat()
+
+
+# --- Sidebar: new chat, recent chats, upload ---
+with st.sidebar:
+    if st.button("➕ New chat", use_container_width=True):
+        start_new_chat()
+        st.rerun()
 
     st.divider()
-    st.header("How it works")
-    st.markdown(
-        "1. Your question is embedded\n"
-        "2. Top-3 relevant chunks retrieved from Qdrant\n"
-        "3. Only those chunks + your question go to Groq LLM\n"
-        "4. Answer is grounded in company documents only"
-    )
+    st.subheader("Recent chats")
+    for c in list_chats():
+        label = c["title"]
+        is_active = c["chat_id"] == st.session_state.active_chat_id
+        cols = st.columns([5, 1])
+        with cols[0]:
+            if st.button(
+                ("**" + label + "**") if is_active else label,
+                key=f"chat_{c['chat_id']}",
+                use_container_width=True,
+            ):
+                load_chat(c["chat_id"])
+                st.rerun()
+        with cols[1]:
+            if st.button("🗑", key=f"del_{c['chat_id']}"):
+                delete_chat(c["chat_id"])
+                if is_active:
+                    st.session_state.active_chat_id = None
+                st.rerun()
 
-if not api_key_present:
-    st.error("GROQ_API_KEY environment variable is not set. Set it in your terminal and rerun Streamlit.")
-    st.stop()
+    st.divider()
+    st.header("Upload a document")
+    active_source = get_active_source()
+    if active_source:
+        st.caption(f"This chat's document: **{active_source}**")
 
-if not collection_exists:
-    st.error(f"Collection '{COLLECTION_NAME}' not found. Run `python ingest.py` first.")
-    st.stop()
+    uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
+    if uploaded_file is not None:
+        already_done = uploaded_file.name in st.session_state.processed_files
+        label = "Re-process anyway" if already_done else "Process & Index PDF"
+        if st.button(label, type="primary"):
+            process_pdf(uploaded_file)
+            st.rerun()
 
-embed_model = load_embed_model()
-groq_client = load_groq_client()
-full_docs_tokens = get_full_docs_token_estimate(qdrant_client)
+    st.divider()
+    st.session_state.debug_mode = st.checkbox("Show relevance scores (debug)", value=False)
 
-# Chat history in session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-# Render past messages
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-        if msg["role"] == "assistant" and "meta" in msg:
-            meta = msg["meta"]
-            with st.expander("📎 Sources & cost details"):
-                for src in meta["sources"]:
-                    st.write(f"- **{src['source']}** (relevance score: {src['score']:.3f})")
-                st.divider()
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Without RAG (tokens)", meta["full_tokens"])
-                c2.metric("With RAG (tokens)", meta["rag_tokens"])
-                c3.metric("Savings", f"{meta['savings_pct']}%")
+# --- Main: chat interface ---
+active_source = get_active_source()
 
-# Chat input
-user_query = st.chat_input("Ask a question... (e.g. what is the return policy?)")
+if not active_source:
+    st.info("Upload a PDF in the sidebar to start chatting in this session.")
+else:
+    st.caption(f"Chatting with: **{active_source}**")
 
-if user_query:
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.write(user_query)
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("sources"):
+                with st.expander("Sources"):
+                    for s in msg["sources"]:
+                        st.caption(f"- {s['source']} · page {s['page']} · {s['type']} · score {s['score']:.3f}")
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            retrieved = retrieve_chunks(qdrant_client,embed_model  ,user_query)
+    question = st.chat_input("Ask a question about this document...")
 
-            if not retrieved:
-                answer = "Sorry, no relevant information was found."
-                st.write(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-            else:
-                user_prompt = build_prompt(user_query, retrieved)
-                answer, usage = ask_groq(groq_client, user_prompt)
-                st.write(answer)
+    if question:
+        chat_id = st.session_state.active_chat_id
 
-                rag_tokens = usage.prompt_tokens
-                savings_pct = round((1 - rag_tokens / full_docs_tokens) * 100, 1) if full_docs_tokens else 0
+        st.session_state.messages.append({"role": "user", "content": question, "sources": []})
+        add_message(chat_id, "user", question)
+        rename_chat_if_untitled(chat_id, question)
+        with st.chat_message("user"):
+            st.markdown(question)
 
-                meta = {
-                    "sources": [{"source": r.payload["source"], "score": r.score} for r in retrieved],
-                    "full_tokens": full_docs_tokens,
-                    "rag_tokens": rag_tokens,
-                    "savings_pct": savings_pct,
-                }
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner("Searching and generating answer..."):
+                    history_for_llm = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in st.session_state.messages[:-1]
+                    ]
+                    result = answer_question(
+                        question,
+                        chat_history=history_for_llm,
+                        filter_conditions={"source": active_source},
+                    )
+            except Exception as e:
+                st.error(f"Something went wrong while answering: {e}")
+                with st.expander("Error details"):
+                    st.exception(e)
+                result = None
 
-                with st.expander("📎 Sources & cost details"):
-                    for src in meta["sources"]:
-                        st.write(f"- **{src['source']}** (relevance score: {src['score']:.3f})")
-                    st.divider()
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Without RAG (tokens)", meta["full_tokens"])
-                    c2.metric("With RAG (tokens)", meta["rag_tokens"])
-                    c3.metric("Savings", f"{meta['savings_pct']}%")
+            if result is not None:
+                st.markdown(result["answer"])
+                if result.get("in_scope") and result["sources"]:
+                    with st.expander("Sources"):
+                        for s in result["sources"]:
+                            st.caption(f"- {s['source']} · page {s['page']} · {s['type']} · score {s['score']:.3f}")
 
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": answer, "meta": meta}
-                )
+                if st.session_state.get("debug_mode") and result.get("top_score") is not None:
+                    st.caption(f"🔧 debug: top score = {result['top_score']:.3f} (threshold = {config.MIN_RELEVANCE_SCORE}) · in_scope = {result.get('in_scope')}")
+                if st.session_state.get("debug_mode") and result.get("standalone_question") and result["standalone_question"] != question:
+                    st.caption(f"🔧 debug: rewritten as → \"{result['standalone_question']}\"")
+
+        if result is not None:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": result["answer"],
+                "sources": result["sources"],
+            })
+            add_message(chat_id, "assistant", result["answer"], sources=result["sources"])
+            st.rerun()  # refresh sidebar so this chat moves to top of "recent"
