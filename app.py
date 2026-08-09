@@ -3,8 +3,8 @@ app.py
 
 Streamlit UI for the RAG pipeline, with ChatGPT-style persistent chat
 sessions (single-user, no login — see chat_store.py):
-    1. User uploads a PDF, indexed via the pipeline (loaders -> chunking
-       -> embeddings -> vector_store).
+    1. User uploads a PDF or image, indexed via the pipeline (loaders ->
+       chunking -> embeddings -> vector_store).
     2. Each chat session is tied to one document and stored in SQLite, so
        chat history survives app restarts / new browser tabs.
     3. Sidebar shows recent chats (most recently active first), a
@@ -22,7 +22,7 @@ import tempfile
 
 import streamlit as st
 
-from src.loaders import read_pdf
+from src.loaders import read_pdf, read_image_file
 from src.chunking import chunk_documents
 from src.embedding import embed_documents
 from src.vector_store import upsert_documents
@@ -37,6 +37,9 @@ init_db()
 
 st.set_page_config(page_title="Chat with your PDF", page_icon="📄", layout="wide")
 st.title("Helper.ai")
+
+# File types accepted by the uploader / process_upload dispatch below.
+IMAGE_EXTS = ("png", "jpg", "jpeg")
 
 # --- Session state setup ---
 if "processed_files" not in st.session_state:
@@ -59,13 +62,15 @@ def start_new_chat() -> None:
     load_chat(chat_id)
 
 
-def process_pdf(uploaded_file) -> bool:
+def process_upload(uploaded_file) -> bool:
     """
-    Save the upload to disk, run it through the full pipeline, upsert into
-    Qdrant, and attach it as the active chat's document. Returns True on
-    success, False on failure (with an error shown to the user).
+    Save the upload to disk, run it through the full pipeline (routing to
+    the PDF or image loader depending on file type), upsert into Qdrant,
+    and attach it as the active chat's document. Returns True on success,
+    False on failure (with an error shown to the user).
     """
     filename = uploaded_file.name
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -74,10 +79,19 @@ def process_pdf(uploaded_file) -> bool:
                 f.write(uploaded_file.getbuffer())
 
             with st.spinner(f"Extracting '{filename}' (text, tables, charts)..."):
-                pages = read_pdf(tmp_path)
-                flat_chunks = [
-                    {"page": p["page"], **c} for p in pages for c in p["chunks"]
-                ]
+                if ext == "pdf":
+                    pages = read_pdf(tmp_path)
+                    flat_chunks = [
+                        {"page": p["page"], **c} for p in pages for c in p["chunks"]
+                    ]
+                elif ext in IMAGE_EXTS:
+                    # read_image_file() already returns a flat chunk list
+                    # (single vision chunk, page=None) — no flattening needed.
+                    flat_chunks = read_image_file(tmp_path)
+                else:
+                    st.error(f"Unsupported file type: .{ext or '?'}")
+                    return False
+
                 docs = [{"source": filename, "chunks": flat_chunks}]
 
             with st.spinner("Chunking..."):
@@ -158,12 +172,15 @@ with st.sidebar:
     if active_source:
         st.caption(f"This chat's document: **{active_source}**")
 
-    uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
+    uploaded_file = st.file_uploader(
+        "Choose a PDF or image",
+        type=["pdf", "png", "jpg", "jpeg"],
+    )
     if uploaded_file is not None:
         already_done = uploaded_file.name in st.session_state.processed_files
-        label = "Re-process anyway" if already_done else "Process & Index PDF"
+        label = "Re-process anyway" if already_done else "Process & Index File"
         if st.button(label, type="primary"):
-            process_pdf(uploaded_file)
+            process_upload(uploaded_file)
             st.rerun()
 
     st.divider()
@@ -174,7 +191,7 @@ with st.sidebar:
 active_source = get_active_source()
 
 if not active_source:
-    st.info("Upload a PDF in the sidebar to start chatting in this session.")
+    st.info("Upload a PDF or image in the sidebar to start chatting in this session.")
 else:
     st.caption(f"Chatting with: **{active_source}**")
 
