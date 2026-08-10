@@ -29,7 +29,7 @@ MIN_TEXT_LENGTH_THRESHOLD = 20
 
 # Vision model (Gemini) 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash-lite")
 PAGE_RENDER_DPI = 200  
 
 # --- Vision prompts used by src/loaders.py ---

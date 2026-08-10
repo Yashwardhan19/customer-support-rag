@@ -138,7 +138,11 @@ def extract_page_text_and_tables(pl_page: "pdfplumber.page.Page"):
     structured table output. Bboxes are shrunk slightly inward so text
     that merely borders the table (not inside it) isn't clipped.
     """
-    found_tables = pl_page.find_tables()
+    # Use "text" strategy instead of default "lines" to prevent infinite hangs 
+    # on heavily styled PDFs with vector backgrounds (like grids/charts).
+    found_tables = pl_page.find_tables(
+        table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"}
+    )
 
     if not found_tables:
         return pl_page.extract_text() or "", []
